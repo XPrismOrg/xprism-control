@@ -1,0 +1,77 @@
+.TH XPRISMCTL 1 "November 2026" "xprism-control 26.11.01"
+.SH NAME
+xprismctl \- XPrism's settings from the terminal
+.SH SYNOPSIS
+.B xprismctl
+[\fB\-d\fP \fIdisplay\fP] \fIcommand\fP [\fIargs\fP...]
+.SH DESCRIPTION
+.B xprismctl
+shows and changes the runtime settings of the XPrism X server: the
+colour settings of each output, the namespaces applications are confined
+to, what each namespace may do, and permission prompts.
+.PP
+Changes last until the server exits. To keep them, put them in
+.BR xorg.conf (5)
+(HDR, EDR, WideGamut) or in the server's namespace configuration file.
+.PP
+Namespaces, apps and prompts use the X-NAMESPACE extension, which XPrism
+offers only to clients of the session (the root namespace), i.e. with the
+session's
+.BR $XAUTHORITY .
+Confined applications cannot use them.
+.SH COMMANDS
+.TP
+.B status
+The server, its version, and whether the compositor, colour management
+and namespaces are available.
+.TP
+.B displays
+Each output: its mode, the HDR, EDR and wide gamut settings (\- where the
+driver has none), and what the compositor shows on it.
+.TP
+\fBdisplay\fP \fIoutput\fP \fBhdr\fP|\fBedr\fP|\fBwide-gamut\fP \fBon\fP|\fBoff\fP
+Change a setting of an output.
+.TP
+.B apps
+Connected applications: their namespace, application id or command, process
+id, and the permissions they hold.
+.TP
+.B namespaces
+Each namespace, how many applications it has, and its permissions.
+.TP
+\fBnamespace create\fP \fIname\fP [\fIcap\fP...] [\fB\-\-transient\fP]
+Create a namespace, optionally with permissions. A transient one goes
+away with its last application.
+.TP
+\fBnamespace delete\fP \fIname\fP [\fB\-\-close\-apps\fP]
+Delete a namespace. Without \fB\-\-close\-apps\fP it fails while
+applications use it.
+.TP
+\fBgrant\fP \fInamespace\fP \fIcap\fP...
+.TQ
+\fBrevoke\fP \fInamespace\fP \fIcap\fP...
+Add or remove permissions; \fBall\fP stands for every one. The
+built-in namespaces root and anon cannot be changed.
+.TP
+.B caps
+List the permissions and what each allows.
+.TP
+.B agent
+Answer permission prompts in the terminal: when a confined application
+needs a permission it lacks (capability mode enforce), print what it wants
+and read an answer: \fBa\fP allow once, \fBw\fP allow while it runs,
+\fBd\fP deny, \fBf\fP deny and do not ask again. Only one program answers
+prompts at a time.
+.SH EXIT STATUS
+0 on success, 1 when the server refused or is unreachable, 2 for bad usage.
+.SH EXAMPLES
+.nf
+xprismctl display eDP-1 edr on
+xprismctl namespace create browser clipboard.read clipboard.write
+xprismctl revoke browser clipboard.read
+xprismctl namespace delete browser \-\-close\-apps
+.fi
+.SH SEE ALSO
+.BR xprism\-control\-panel (1),
+.BR Xserver (1),
+.BR xprism\-permission\-agent (1)

@@ -1,0 +1,12 @@
+name: build
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y meson ninja-build pkg-config libxcb1-dev libxcb-randr0-dev libxcb-res0-dev libgtk-4-dev
+      - run: meson setup build -Dgui=enabled -Dwerror=true
+      - run: ninja -C build
+      # the tests need XPrism's Xvfb, which is not built here: they skip
+      - run: meson test -C build --print-errorlogs

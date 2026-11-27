@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=XPrism Control Panel
+Comment=Displays, namespaces and app permissions of the XPrism X server
+Exec=xprism-control-panel
+Icon=preferences-desktop-display
+Categories=Settings;System;
+Keywords=HDR;EDR;display;namespace;permission;sandbox;X11;
