@@ -1,5 +1,5 @@
 project('xprism-control', 'c',
-  version: '26.11.01',
+  version: '26.11.02',
   license: 'MIT',
   meson_version: '>= 0.60',
   default_options: ['c_std=c11', 'warning_level=2', 'buildtype=debugoptimized'])
