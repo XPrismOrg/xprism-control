@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=XPrism display layout
+Comment=Puts back the display layout kept in XPrism Control Panel
+Exec=xprismctl displays restore
+TryExec=xprismctl
+NoDisplay=true
+OnlyShowIn=XFCE;LXQt;MATE;X-Cinnamon;Openbox;i3;
+X-GNOME-Autostart-Phase=Initialization

@@ -3,7 +3,8 @@
  * xprism-control-panel: XPrism's settings in a window (GTK 4).
  *
  * Four pages, each a thin view over libxpctl:
- *   Displays     HDR, EDR and wide gamut per output
+ *   Displays     resolution, refresh rate, position, rotation, primary,
+ *                on/off; HDR, EDR and wide gamut per output
  *   Namespaces   create, delete, and choose what each may do
  *   Apps         connected applications (refreshed every two seconds)
  *   Prompts      answer confined applications' permission requests
@@ -139,6 +140,406 @@ setting_row(const xpctl_output *o, enum xpctl_setting s, const char *title, cons
     return row;
 }
 
+
+/* Layout changes are applied at once and confirmed like on other systems:
+   a bar asks to keep them, and without an answer in 15 seconds the old
+   layout comes back (a refresh rate the monitor cannot show leaves it
+   black). Keep also saves the layout for the next login. */
+#define CONFIRM_SECONDS 15
+static GtkWidget *confirm_bar, *confirm_label;
+static xpctl_layout *undo_layout;
+static int undo_n;
+static guint confirm_timer;
+static int confirm_left;
+
+static void
+confirm_done(void)
+{
+    if (confirm_timer)
+        g_source_remove(confirm_timer);
+    confirm_timer = 0;
+    free(undo_layout);
+    undo_layout = NULL;
+    undo_n = 0;
+    gtk_widget_set_visible(confirm_bar, FALSE);
+}
+
+static void
+on_revert(GtkButton *b, gpointer data)
+{
+    (void) b; (void) data;
+    if (undo_layout && xpctl_layout_apply(x, undo_layout, undo_n) < 0)
+        show_error(xpctl_error(x));
+    confirm_done();
+    refresh_displays();
+}
+
+static void
+on_keep(GtkButton *b, gpointer data)
+{
+    (void) b; (void) data;
+    confirm_done();
+    xpctl_layout *l;
+    int n;
+    if (xpctl_layout_get(x, &l, &n) == 0) {
+        if (xpctl_layout_save(x, NULL, l, n) < 0)
+            show_error(xpctl_error(x));
+        free(l);
+    }
+}
+
+static void
+confirm_text(void)
+{
+    char *t = g_strdup_printf("Keep these display settings? Going back in %d s.", confirm_left);
+    gtk_label_set_text(GTK_LABEL(confirm_label), t);
+    g_free(t);
+}
+
+static gboolean
+on_confirm_tick(gpointer data)
+{
+    (void) data;
+    if (--confirm_left > 0) {
+        confirm_text();
+        return G_SOURCE_CONTINUE;
+    }
+    confirm_timer = 0;
+    on_revert(NULL, NULL);
+    return G_SOURCE_REMOVE;
+}
+
+/* rebuilding the page destroys the widget whose signal is running: later */
+static gboolean
+refresh_displays_idle(gpointer data)
+{
+    (void) data;
+    refresh_displays();
+    return G_SOURCE_REMOVE;
+}
+
+/* changes one output: takes the layout now, lets edit() change the
+   output's entry, applies it, and asks to keep it */
+static void
+change_output(const char *name, void (*edit)(xpctl_layout *l, gpointer arg), gpointer arg)
+{
+    xpctl_layout *l;
+    int n;
+    if (xpctl_layout_get(x, &l, &n) < 0) {
+        show_error(xpctl_error(x));
+        return;
+    }
+    xpctl_layout *mine = NULL;
+    for (int i = 0; i < n; i++)
+        if (!strcmp(l[i].name, name))
+            mine = &l[i];
+    if (!mine) {
+        free(l);
+        g_idle_add(refresh_displays_idle, NULL);
+        return;
+    }
+    xpctl_layout *before = g_memdup2(l, n * sizeof(*l));
+    edit(mine, arg);
+    if (xpctl_layout_apply(x, mine, 1) < 0) {
+        show_error(xpctl_error(x));
+        g_free(before);
+    } else {
+        clear_error();
+        if (!undo_layout) {     /* several changes: back to before the first */
+            undo_layout = malloc(n * sizeof(*l));
+            if (undo_layout) {
+                memcpy(undo_layout, before, n * sizeof(*l));
+                undo_n = n;
+            }
+        }
+        g_free(before);
+        confirm_left = CONFIRM_SECONDS;
+        confirm_text();
+        gtk_widget_set_visible(confirm_bar, TRUE);
+        if (!confirm_timer)
+            confirm_timer = g_timeout_add_seconds(1, on_confirm_tick, NULL);
+    }
+    free(l);
+    g_idle_add(refresh_displays_idle, NULL);
+}
+
+typedef struct {
+    xpctl_mode *modes;
+    int n;
+    int sizes[64][2];           /* the resolution dropdown's entries */
+    int nsizes;
+    double rates[64];           /* the refresh dropdown's entries */
+    int nrates;
+} output_modes;
+
+static void
+output_modes_free(gpointer p)
+{
+    output_modes *m = p;
+    free(m->modes);
+    g_free(m);
+}
+
+static void
+edit_size(xpctl_layout *l, gpointer arg)
+{
+    int *wh = arg;
+    l->enabled = true;
+    l->width = wh[0];
+    l->height = wh[1];
+    l->refresh = 0;             /* the fastest at that size */
+}
+
+static void
+on_size(GObject *dd, GParamSpec *ps, gpointer data)
+{
+    (void) ps; (void) data;
+    if (updating)
+        return;
+    output_modes *m = g_object_get_data(dd, "modes");
+    guint i = gtk_drop_down_get_selected(GTK_DROP_DOWN(dd));
+    if (i >= (guint) m->nsizes)
+        return;
+    change_output(g_object_get_data(dd, "output"), edit_size, m->sizes[i]);
+}
+
+static void
+edit_rate(xpctl_layout *l, gpointer arg)
+{
+    l->refresh = *(double *) arg;
+}
+
+static void
+on_rate(GObject *dd, GParamSpec *ps, gpointer data)
+{
+    (void) ps; (void) data;
+    if (updating)
+        return;
+    output_modes *m = g_object_get_data(dd, "modes");
+    guint i = gtk_drop_down_get_selected(GTK_DROP_DOWN(dd));
+    if (i >= (guint) m->nrates)
+        return;
+    change_output(g_object_get_data(dd, "output"), edit_rate, &m->rates[i]);
+}
+
+static const int rotations[] = { 0, 90, 180, 270 };
+
+static void
+edit_rotation(xpctl_layout *l, gpointer arg)
+{
+    l->rotation = GPOINTER_TO_INT(arg);
+}
+
+static void
+on_rotation(GObject *dd, GParamSpec *ps, gpointer data)
+{
+    (void) ps; (void) data;
+    if (updating)
+        return;
+    guint i = gtk_drop_down_get_selected(GTK_DROP_DOWN(dd));
+    if (i < G_N_ELEMENTS(rotations))
+        change_output(g_object_get_data(dd, "output"), edit_rotation,
+                      GINT_TO_POINTER(rotations[i]));
+}
+
+static void
+edit_primary(xpctl_layout *l, gpointer arg)
+{
+    (void) arg;
+    l->primary = true;
+}
+
+static void
+on_primary(GtkCheckButton *c, gpointer data)
+{
+    (void) data;
+    if (updating || !gtk_check_button_get_active(c))
+        return;
+    change_output(g_object_get_data(G_OBJECT(c), "output"), edit_primary, NULL);
+}
+
+static void
+edit_position(xpctl_layout *l, gpointer arg)
+{
+    int *xy = arg;
+    l->x = xy[0];
+    l->y = xy[1];
+}
+
+static void
+on_move(GtkButton *b, gpointer data)
+{
+    (void) data;
+    GtkSpinButton *sx = g_object_get_data(G_OBJECT(b), "x"),
+                  *sy = g_object_get_data(G_OBJECT(b), "y");
+    int xy[2] = { gtk_spin_button_get_value_as_int(sx), gtk_spin_button_get_value_as_int(sy) };
+    change_output(g_object_get_data(G_OBJECT(b), "output"), edit_position, xy);
+}
+
+static void
+edit_enabled(xpctl_layout *l, gpointer arg)
+{
+    xpctl_layout *want = arg;
+    *l = *want;
+}
+
+static gboolean
+on_enabled(GtkSwitch *sw, gboolean on, gpointer data)
+{
+    (void) data;
+    if (updating)
+        return FALSE;
+    const char *name = g_object_get_data(G_OBJECT(sw), "output");
+    xpctl_layout want = { 0 };
+    g_strlcpy(want.name, name, sizeof(want.name));
+    if (on) {
+        /* its preferred mode, right of the others */
+        output_modes *m = g_object_get_data(G_OBJECT(sw), "modes");
+        if (!m || !m->n)
+            return TRUE;
+        int best = 0;
+        for (int i = 0; i < m->n; i++)
+            if (m->modes[i].preferred) {
+                best = i;
+                break;
+            }
+        want.enabled = true;
+        want.width = m->modes[best].width;
+        want.height = m->modes[best].height;
+        want.refresh = m->modes[best].refresh;
+        xpctl_layout *l;
+        int n;
+        if (xpctl_layout_get(x, &l, &n) == 0) {
+            for (int i = 0; i < n; i++)
+                if (l[i].enabled) {
+                    int w = (l[i].rotation % 180) ? l[i].height : l[i].width;
+                    if (l[i].x + w > want.x)
+                        want.x = l[i].x + w;
+                }
+            free(l);
+        }
+    }
+    change_output(name, edit_enabled, &want);
+    return TRUE;                /* refresh_displays sets the switch */
+}
+
+static GtkWidget *
+row(const char *title, GtkWidget *control)
+{
+    GtkWidget *r = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    GtkWidget *t = label(title, NULL);
+    gtk_widget_set_hexpand(t, TRUE);
+    gtk_box_append(GTK_BOX(r), t);
+    gtk_widget_set_valign(control, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(r), control);
+    return r;
+}
+
+static GtkWidget *
+named(GtkWidget *w, const char *output, output_modes *m)
+{
+    g_object_set_data_full(G_OBJECT(w), "output", g_strdup(output), g_free);
+    if (m)
+        g_object_set_data(G_OBJECT(w), "modes", m);
+    return w;
+}
+
+/* the layout rows of one output, into box */
+static void
+layout_rows(GtkWidget *box, GtkWidget *frame, const xpctl_layout *l)
+{
+    output_modes *m = g_new0(output_modes, 1);
+    xpctl_output_modes(x, l->name, &m->modes, &m->n);
+    /* the frame owns it: every widget below dies with the frame */
+    g_object_set_data_full(G_OBJECT(frame), "modes", m, output_modes_free);
+
+    GtkStringList *sizes = gtk_string_list_new(NULL);
+    guint size_sel = GTK_INVALID_LIST_POSITION;
+    for (int i = 0; i < m->n && m->nsizes < 64; i++) {
+        bool seen = false;
+        for (int j = 0; j < m->nsizes; j++)
+            if (m->sizes[j][0] == m->modes[i].width && m->sizes[j][1] == m->modes[i].height)
+                seen = true;
+        if (seen)
+            continue;
+        bool pref = false;
+        for (int j = 0; j < m->n; j++)
+            if (m->modes[j].width == m->modes[i].width &&
+                m->modes[j].height == m->modes[i].height && m->modes[j].preferred)
+                pref = true;
+        char *t = g_strdup_printf("%d × %d%s", m->modes[i].width, m->modes[i].height,
+                                  pref ? " (recommended)" : "");
+        gtk_string_list_append(sizes, t);
+        g_free(t);
+        if (l->enabled && m->modes[i].width == l->width && m->modes[i].height == l->height)
+            size_sel = m->nsizes;
+        m->sizes[m->nsizes][0] = m->modes[i].width;
+        m->sizes[m->nsizes][1] = m->modes[i].height;
+        m->nsizes++;
+    }
+    GtkWidget *size = named(gtk_drop_down_new(G_LIST_MODEL(sizes), NULL), l->name, m);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(size), size_sel);
+    g_signal_connect(size, "notify::selected", G_CALLBACK(on_size), NULL);
+    gtk_widget_set_sensitive(size, l->enabled);
+    gtk_box_append(GTK_BOX(box), row("Resolution", size));
+
+    GtkStringList *rates = gtk_string_list_new(NULL);
+    guint rate_sel = GTK_INVALID_LIST_POSITION;
+    double best = 1e9;
+    for (int i = 0; i < m->n && m->nrates < 64; i++) {
+        if (m->modes[i].width != l->width || m->modes[i].height != l->height)
+            continue;
+        char *t = m->modes[i].refresh >= 1 ? g_strdup_printf("%.2f Hz", m->modes[i].refresh)
+                                           : g_strdup("not reported");
+        gtk_string_list_append(rates, t);
+        g_free(t);
+        double d = m->modes[i].refresh - l->refresh;
+        if (d < 0)
+            d = -d;
+        if (d < best) {
+            best = d;
+            rate_sel = m->nrates;
+        }
+        m->rates[m->nrates++] = m->modes[i].refresh;
+    }
+    GtkWidget *rate = named(gtk_drop_down_new(G_LIST_MODEL(rates), NULL), l->name, m);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(rate), rate_sel);
+    g_signal_connect(rate, "notify::selected", G_CALLBACK(on_rate), NULL);
+    gtk_widget_set_sensitive(rate, l->enabled);
+    gtk_box_append(GTK_BOX(box), row("Refresh rate", rate));
+
+    const char *rot_names[] = { "Normal", "Left", "Upside down", "Right", NULL };
+    GtkWidget *rot = named(gtk_drop_down_new_from_strings(rot_names), l->name, NULL);
+    for (guint i = 0; i < G_N_ELEMENTS(rotations); i++)
+        if (rotations[i] == l->rotation)
+            gtk_drop_down_set_selected(GTK_DROP_DOWN(rot), i);
+    g_signal_connect(rot, "notify::selected", G_CALLBACK(on_rotation), NULL);
+    gtk_widget_set_sensitive(rot, l->enabled);
+    gtk_box_append(GTK_BOX(box), row("Rotation", rot));
+
+    GtkWidget *pos = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *sx = gtk_spin_button_new_with_range(0, 32767, 1);
+    GtkWidget *sy = gtk_spin_button_new_with_range(0, 32767, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(sx), l->x);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(sy), l->y);
+    GtkWidget *move = named(gtk_button_new_with_label("Move"), l->name, NULL);
+    g_object_set_data(G_OBJECT(move), "x", sx);
+    g_object_set_data(G_OBJECT(move), "y", sy);
+    g_signal_connect(move, "clicked", G_CALLBACK(on_move), NULL);
+    gtk_box_append(GTK_BOX(pos), label("x", "dim-label"));
+    gtk_box_append(GTK_BOX(pos), sx);
+    gtk_box_append(GTK_BOX(pos), label("y", "dim-label"));
+    gtk_box_append(GTK_BOX(pos), sy);
+    gtk_box_append(GTK_BOX(pos), move);
+    gtk_widget_set_sensitive(pos, l->enabled);
+    gtk_box_append(GTK_BOX(box), row("Position", pos));
+
+    GtkWidget *prim = named(gtk_check_button_new(), l->name, NULL);
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(prim), l->primary);
+    gtk_widget_set_sensitive(prim, l->enabled && !l->primary);
+    g_signal_connect(prim, "toggled", G_CALLBACK(on_primary), NULL);
+    gtk_box_append(GTK_BOX(box), row("Main display (panels and new windows)", prim));
+}
 static void
 refresh_displays(void)
 {
@@ -151,6 +552,9 @@ refresh_displays(void)
         updating = FALSE;
         return;
     }
+    xpctl_layout *lay = NULL;
+    int nlay = 0;
+    xpctl_layout_get(x, &lay, &nlay);
     for (int i = 0; i < n; i++) {
         if (!o[i].connected)
             continue;
@@ -164,8 +568,28 @@ refresh_displays(void)
             : o[i].refresh >= 1 ? g_strdup_printf("%s — %d×%d, %.0f Hz", o[i].name, o[i].width,
                                                   o[i].height, o[i].refresh)
             : g_strdup_printf("%s — %d×%d", o[i].name, o[i].width, o[i].height);
-        gtk_box_append(GTK_BOX(box), label(head, "heading"));
+        GtkWidget *headrow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+        GtkWidget *headlabel = label(head, "heading");
+        gtk_widget_set_hexpand(headlabel, TRUE);
+        gtk_box_append(GTK_BOX(headrow), headlabel);
         g_free(head);
+        const xpctl_layout *l = NULL;
+        for (int j = 0; j < nlay; j++)
+            if (!strcmp(lay[j].name, o[i].name))
+                l = &lay[j];
+        GtkWidget *on = NULL;
+        if (l) {
+            on = named(gtk_switch_new(), o[i].name, NULL);
+            gtk_switch_set_active(GTK_SWITCH(on), l->enabled);
+            gtk_widget_set_valign(on, GTK_ALIGN_CENTER);
+            gtk_box_append(GTK_BOX(headrow), on);
+        }
+        gtk_box_append(GTK_BOX(box), headrow);
+        if (l) {
+            layout_rows(box, frame, l);
+            g_object_set_data(G_OBJECT(on), "modes", g_object_get_data(G_OBJECT(frame), "modes"));
+            g_signal_connect(on, "state-set", G_CALLBACK(on_enabled), NULL);
+        }
         if (o[i].color_known) {
             char *shows;
             if (!strcmp(o[i].transfer, "PQ") || !strcmp(o[i].transfer, "HLG"))
@@ -190,6 +614,7 @@ refresh_displays(void)
         gtk_frame_set_child(GTK_FRAME(frame), box);
         gtk_box_append(GTK_BOX(displays_box), frame);
     }
+    free(lay);
     free(o);
     updating = FALSE;
 }
@@ -626,8 +1051,22 @@ activate(GtkApplication *app, gpointer data)
     gtk_stack_add_titled(GTK_STACK(stack), overview_page(), "overview", "Overview");
 
     GtkWidget *d = page("Displays",
-        "Settings of XPrism's display drivers. They last until the server restarts; for "
-        "good, set the HDR, EDR or WideGamut options in xorg.conf.");
+        "Resolution, refresh rate and placement of each monitor. Changes you keep are "
+        "saved and come back at the next login (xprismctl displays restore). HDR, EDR and "
+        "wide gamut last until the server restarts; for good, set them in xorg.conf.");
+    confirm_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    confirm_label = label("", "heading");
+    gtk_widget_set_hexpand(confirm_label, TRUE);
+    gtk_box_append(GTK_BOX(confirm_bar), confirm_label);
+    GtkWidget *revert = gtk_button_new_with_label("Go back");
+    g_signal_connect(revert, "clicked", G_CALLBACK(on_revert), NULL);
+    gtk_box_append(GTK_BOX(confirm_bar), revert);
+    GtkWidget *keep = gtk_button_new_with_label("Keep");
+    gtk_widget_add_css_class(keep, "suggested-action");
+    g_signal_connect(keep, "clicked", G_CALLBACK(on_keep), NULL);
+    gtk_box_append(GTK_BOX(confirm_bar), keep);
+    gtk_widget_set_visible(confirm_bar, FALSE);
+    gtk_box_append(GTK_BOX(d), confirm_bar);
     displays_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     gtk_box_append(GTK_BOX(d), scrolled(displays_box));
     gtk_stack_add_titled(GTK_STACK(stack), d, "displays", "Displays");

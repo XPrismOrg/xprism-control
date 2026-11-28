@@ -1375,9 +1375,13 @@ xpctl_layout_save(xpctl *x, const char *path, const xpctl_layout *list, int n)
         if (!list[i].enabled)
             fprintf(f, "%s off\n", list[i].name);
         else
-            fprintf(f, "%s %dx%d@%.2f +%d+%d rotate %d%s\n", list[i].name, list[i].width,
-                    list[i].height, list[i].refresh, list[i].x, list[i].y, list[i].rotation,
-                    list[i].primary ? " primary" : "");
+        {
+            /* not %f: the file must read the same in every locale */
+            long centi = (long) (list[i].refresh * 100 + 0.5);
+            fprintf(f, "%s %dx%d@%ld.%02ld +%d+%d rotate %d%s\n", list[i].name, list[i].width,
+                    list[i].height, centi / 100, centi % 100, list[i].x, list[i].y,
+                    list[i].rotation, list[i].primary ? " primary" : "");
+        }
     }
     if (fclose(f) != 0 || rename(tmp, path) != 0) {
         remove(tmp);
@@ -1400,8 +1404,20 @@ parse_layout_line(char *line, xpctl_layout *l)
         return false;
     if (!strcmp(mode, "off"))
         return true;
-    if (sscanf(mode, "%dx%d@%lf", &l->width, &l->height, &l->refresh) < 2)
+    if (sscanf(mode, "%dx%d", &l->width, &l->height) != 2)
         return false;
+    const char *at = strchr(mode, '@');
+    if (at) {
+        /* HZ[.FRACTION], by hand: strtod follows the locale's decimal point */
+        const char *c = at + 1;
+        double v = 0, scale = 1;
+        for (; *c >= '0' && *c <= '9'; c++)
+            v = v * 10 + (*c - '0');
+        if (*c == '.' || *c == ',')
+            for (c++; *c >= '0' && *c <= '9'; c++)
+                v += (*c - '0') * (scale /= 10);
+        l->refresh = v;
+    }
     l->enabled = true;
     for (char *t; (t = strtok_r(NULL, " \t\r\n", &save));) {
         if (t[0] == '+')

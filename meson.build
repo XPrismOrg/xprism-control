@@ -28,6 +28,9 @@ if gtk.found()
 endif
 
 install_man('man/xprismctl.1')
+# the layout kept in the control panel, back at login (XDG autostart)
+install_data('data/xprism-displays-restore.desktop',
+  install_dir: get_option('sysconfdir') / 'xdg' / 'autostart')
 
 xwin = executable('xwin', 'tests/xwin.c', dependencies: xcb)
 test('xprismctl', find_program('tests/run-tests.sh'),
