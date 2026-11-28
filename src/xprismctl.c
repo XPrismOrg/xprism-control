@@ -22,6 +22,13 @@ usage(FILE *f)
 "\n"
 "  status                          the server and what it offers\n"
 "  displays                        outputs, their modes and colour settings\n"
+"  displays save|restore           remember the layout / put it back\n"
+"  modes OUTPUT                    the resolutions and rates an output offers\n"
+"  display OUTPUT mode WxH[@HZ]    resolution and refresh rate (fastest if no HZ)\n"
+"  display OUTPUT position X Y     where it sits on the screen\n"
+"  display OUTPUT rotate normal|left|inverted|right\n"
+"  display OUTPUT primary          the output panels and new windows go to\n"
+"  display OUTPUT on|off\n"
 "  display OUTPUT SETTING on|off   SETTING: hdr, edr or wide-gamut\n"
 "  apps                            connected applications and their namespaces\n"
 "  namespaces                      namespaces and what each may do\n"
@@ -88,6 +95,55 @@ cmd_status(void)
     return 0;
 }
 
+static const char *
+rotation_name(int degrees)
+{
+    switch (degrees) {
+    case 90: return "left";
+    case 180: return "inverted";
+    case 270: return "right";
+    default: return "normal";
+    }
+}
+
+static int
+rotation_parse(const char *name)
+{
+    if (!strcmp(name, "normal") || !strcmp(name, "0"))
+        return 0;
+    if (!strcmp(name, "left") || !strcmp(name, "90"))
+        return 90;
+    if (!strcmp(name, "inverted") || !strcmp(name, "180"))
+        return 180;
+    if (!strcmp(name, "right") || !strcmp(name, "270"))
+        return 270;
+    return -1;
+}
+
+static int
+cmd_displays_saved(const char *what)
+{
+    if (!strcmp(what, "save")) {
+        xpctl_layout *l;
+        int n;
+        if (xpctl_layout_get(x, &l, &n) < 0)
+            return die();
+        int r = xpctl_layout_save(x, NULL, l, n);
+        free(l);
+        if (r < 0)
+            return die();
+        printf("saved to %s\n", xpctl_layout_path());
+        return 0;
+    }
+    if (!strcmp(what, "restore")) {
+        if (xpctl_layout_restore(x, NULL) < 0)
+            return die();
+        printf("restored from %s\n", xpctl_layout_path());
+        return 0;
+    }
+    return usage(stderr), 2;
+}
+
 static int
 cmd_displays(void)
 {
@@ -95,8 +151,11 @@ cmd_displays(void)
     int n;
     if (xpctl_outputs(x, &o, &n) < 0)
         return die();
-    printf("%-10s %-20s %-4s %-4s %-10s %s\n", "OUTPUT", "MODE", "HDR", "EDR", "WIDE-GAMUT",
-           "SHOWS");
+    xpctl_layout *lay = NULL;
+    int nlay = 0;
+    xpctl_layout_get(x, &lay, &nlay);
+    printf("%-10s %-20s %-4s %-4s %-10s %-24s %s\n", "OUTPUT", "MODE", "HDR", "EDR",
+           "WIDE-GAMUT", "SHOWS", "WHERE");
     for (int i = 0; i < n; i++) {
         char mode[32] = "off";
         if (!o[i].connected)
@@ -117,16 +176,176 @@ cmd_displays(void)
             else
                 snprintf(shows, sizeof(shows), "%s", o[i].primaries);
         }
-        printf("%-10s %-20s %-4s %-4s %-10s %s\n", o[i].name, mode, onoff(o[i].hdr),
-               onoff(o[i].edr), onoff(o[i].wide_gamut), shows);
+        char where[64] = "-";
+        for (int j = 0; j < nlay; j++)
+            if (!strcmp(lay[j].name, o[i].name) && lay[j].enabled)
+                snprintf(where, sizeof(where), "+%d+%d %s%s", lay[j].x, lay[j].y,
+                         rotation_name(lay[j].rotation), lay[j].primary ? " primary" : "");
+        printf("%-10s %-20s %-4s %-4s %-10s %-24s %s\n", o[i].name, mode, onoff(o[i].hdr),
+               onoff(o[i].edr), onoff(o[i].wide_gamut), shows, where);
     }
+    free(lay);
     free(o);
+    return 0;
+}
+
+static int
+cmd_modes(int argc, char **argv)
+{
+    if (argc != 1)
+        return usage(stderr), 2;
+    xpctl_mode *m;
+    int n;
+    if (xpctl_output_modes(x, argv[0], &m, &n) < 0)
+        return die();
+    for (int i = 0; i < n; i++)
+        printf("%5dx%-5d %7.2f Hz%s%s\n", m[i].width, m[i].height, m[i].refresh,
+               m[i].current ? "  current" : "", m[i].preferred ? "  preferred" : "");
+    free(m);
+    return 0;
+}
+
+/* changes one output's entry in the current layout and applies it */
+static int
+change_layout(const char *output, int (*edit)(xpctl_layout *l, char **args), char **args)
+{
+    xpctl_layout *l;
+    int n;
+    if (xpctl_layout_get(x, &l, &n) < 0)
+        return die();
+    xpctl_layout *mine = NULL;
+    for (int i = 0; i < n; i++)
+        if (!strcmp(l[i].name, output))
+            mine = &l[i];
+    if (!mine) {
+        free(l);
+        fprintf(stderr, "xprismctl: no connected output %s\n", output);
+        return 1;
+    }
+    int r = edit(mine, args);
+    if (r) {
+        free(l);
+        return r;
+    }
+    if (!mine->enabled || !mine->width) {
+        /* turned on: its preferred mode, right of the others */
+        if (mine->enabled) {
+            xpctl_mode *m;
+            int nm;
+            if (xpctl_output_modes(x, output, &m, &nm) < 0 || !nm) {
+                free(l);
+                return die();
+            }
+            int best = 0;
+            for (int i = 0; i < nm; i++)
+                if (m[i].preferred) {
+                    best = i;
+                    break;
+                }
+            mine->width = m[best].width;
+            mine->height = m[best].height;
+            mine->refresh = m[best].refresh;
+            free(m);
+            int right = 0;
+            for (int i = 0; i < n; i++)
+                if (&l[i] != mine && l[i].enabled) {
+                    int w = (l[i].rotation % 180) ? l[i].height : l[i].width;
+                    if (l[i].x + w > right)
+                        right = l[i].x + w;
+                }
+            mine->x = right;
+            mine->y = 0;
+        }
+    }
+    r = xpctl_layout_apply(x, mine, 1);
+    free(l);
+    return r < 0 ? die() : 0;
+}
+
+static int
+edit_mode(xpctl_layout *l, char **args)
+{
+    int w, h;
+    double hz = 0;
+    if (sscanf(args[0], "%dx%d@%lf", &w, &h, &hz) < 2 || w <= 0 || h <= 0) {
+        fprintf(stderr, "xprismctl: give the mode as WIDTHxHEIGHT or WIDTHxHEIGHT@HZ\n");
+        return 2;
+    }
+    l->enabled = true;
+    l->width = w;
+    l->height = h;
+    l->refresh = hz;
+    return 0;
+}
+
+static int
+edit_position(xpctl_layout *l, char **args)
+{
+    char *end1, *end2;
+    long px = strtol(args[0], &end1, 10), py = strtol(args[1], &end2, 10);
+    if (*end1 || *end2 || px < 0 || py < 0) {
+        fprintf(stderr, "xprismctl: the position is two numbers, 0 or more\n");
+        return 2;
+    }
+    l->x = px;
+    l->y = py;
+    return 0;
+}
+
+static int
+edit_rotate(xpctl_layout *l, char **args)
+{
+    int d = rotation_parse(args[0]);
+    if (d < 0) {
+        fprintf(stderr, "xprismctl: rotate normal, left, inverted or right\n");
+        return 2;
+    }
+    l->rotation = d;
+    return 0;
+}
+
+static int
+edit_primary(xpctl_layout *l, char **args)
+{
+    (void) args;
+    l->primary = true;
+    return 0;
+}
+
+static int
+edit_on(xpctl_layout *l, char **args)
+{
+    (void) args;
+    if (!l->enabled) {
+        l->enabled = true;
+        l->width = 0;       /* change_layout picks the preferred mode */
+    }
+    return 0;
+}
+
+static int
+edit_off(xpctl_layout *l, char **args)
+{
+    (void) args;
+    l->enabled = false;
     return 0;
 }
 
 static int
 cmd_display(int argc, char **argv)
 {
+    if (argc == 3 && !strcmp(argv[1], "mode"))
+        return change_layout(argv[0], edit_mode, argv + 2);
+    if (argc == 4 && !strcmp(argv[1], "position"))
+        return change_layout(argv[0], edit_position, argv + 2);
+    if (argc == 3 && !strcmp(argv[1], "rotate"))
+        return change_layout(argv[0], edit_rotate, argv + 2);
+    if (argc == 2 && !strcmp(argv[1], "primary"))
+        return change_layout(argv[0], edit_primary, NULL);
+    if (argc == 2 && !strcmp(argv[1], "on"))
+        return change_layout(argv[0], edit_on, NULL);
+    if (argc == 2 && !strcmp(argv[1], "off"))
+        return change_layout(argv[0], edit_off, NULL);
     if (argc != 3)
         return usage(stderr), 2;
     enum xpctl_setting s;
@@ -376,8 +595,12 @@ main(int argc, char **argv)
     int r;
     if (!strcmp(cmd, "status"))
         r = cmd_status();
+    else if (!strcmp(cmd, "displays") && argc == 2)
+        r = cmd_displays_saved(argv[1]);
     else if (!strcmp(cmd, "displays"))
         r = cmd_displays();
+    else if (!strcmp(cmd, "modes"))
+        r = cmd_modes(argc - 1, argv + 1);
     else if (!strcmp(cmd, "display"))
         r = cmd_display(argc - 1, argv + 1);
     else if (!strcmp(cmd, "apps"))

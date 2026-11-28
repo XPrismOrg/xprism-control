@@ -27,7 +27,33 @@ and namespaces are available.
 .TP
 .B displays
 Each output: its mode, the HDR, EDR and wide gamut settings (\- where the
-driver has none), and what the compositor shows on it.
+driver has none), what the compositor shows on it, and where it is.
+.TP
+\fBdisplays save\fP|\fBrestore\fP
+Write the current layout (mode, refresh rate, position, rotation, primary) to
+\fI$XDG_CONFIG_HOME/xprism/displays.conf\fP, or set it back from there.
+Outputs in the file that are not connected are skipped.
+.TP
+\fBmodes\fP \fIoutput\fP
+The resolutions and refresh rates the output offers, largest and fastest
+first.
+.TP
+\fBdisplay\fP \fIoutput\fP \fBmode\fP \fIW\fP\fBx\fP\fIH\fP[\fB@\fP\fIHz\fP]
+Set the resolution, at the given refresh rate or the fastest there is. The
+screen grows or shrinks to fit.
+.TP
+\fBdisplay\fP \fIoutput\fP \fBposition\fP \fIx y\fP
+Move the output's top-left corner on the screen.
+.TP
+\fBdisplay\fP \fIoutput\fP \fBrotate normal\fP|\fBleft\fP|\fBinverted\fP|\fBright\fP
+.TP
+\fBdisplay\fP \fIoutput\fP \fBprimary\fP
+The output panels and new windows go to.
+.TP
+\fBdisplay\fP \fIoutput\fP \fBon\fP|\fBoff\fP
+Turning an output on uses its preferred mode, right of the others. Turning
+the last one off is refused. If the driver refuses a change, the old layout
+is put back.
 .TP
 \fBdisplay\fP \fIoutput\fP \fBhdr\fP|\fBedr\fP|\fBwide-gamut\fP \fBon\fP|\fBoff\fP
 Change a setting of an output.

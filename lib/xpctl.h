@@ -66,6 +66,51 @@ typedef struct {
 /* *outs is malloc'd; free() it */
 int xpctl_outputs(xpctl *x, xpctl_output **outs, int *n);
 
+/* ---- display layout (RandR) ---------------------------------------- */
+
+typedef struct {
+    int width, height;
+    double refresh;             /* Hz */
+    bool preferred;             /* what the monitor asks for */
+    bool current;
+} xpctl_mode;
+
+/* The modes an output offers, largest first and fastest first within a
+   size. *modes is malloc'd; free() it. */
+int xpctl_output_modes(xpctl *x, const char *output, xpctl_mode **modes, int *n);
+
+/* Where and how one output shows the screen. */
+typedef struct {
+    char name[32];
+    bool enabled;
+    int width, height;          /* the mode, before rotation */
+    double refresh;             /* Hz; 0: the fastest at that size */
+    int x, y;                   /* top-left corner on the screen */
+    int rotation;               /* 0, 90, 180 or 270 degrees counter-clockwise,
+                                   as RandR (xrandr: normal, left, inverted,
+                                   right) */
+    bool primary;
+} xpctl_layout;
+
+/* The connected outputs as they are now. *list is malloc'd; free() it. */
+int xpctl_layout_get(xpctl *x, xpctl_layout **list, int *n);
+
+/* Sets the listed outputs; outputs not listed keep what they have. The
+   screen is resized to fit. Refuses to turn every output off. */
+int xpctl_layout_apply(xpctl *x, const xpctl_layout *list, int n);
+
+/* The saved layout: ~/.config/xprism/displays.conf, one line per output:
+     DP-1 1920x1080@239.96 +0+0 rotate 0 primary
+     HDMI-1 off
+   path NULL: that default. */
+const char *xpctl_layout_path(void);
+int xpctl_layout_save(xpctl *x, const char *path, const xpctl_layout *list, int n);
+/* *list is malloc'd; free() it. A missing file is an empty layout. */
+int xpctl_layout_load(const char *path, xpctl_layout **list, int *n);
+/* xpctl_layout_load + xpctl_layout_apply, for the outputs that are
+   connected now (others in the file are skipped). */
+int xpctl_layout_restore(xpctl *x, const char *path);
+
 enum xpctl_setting { XPCTL_HDR, XPCTL_WIDE_GAMUT, XPCTL_EDR };
 const char *xpctl_setting_name(enum xpctl_setting s);     /* "hdr", ... */
 int xpctl_output_set(xpctl *x, const char *output, enum xpctl_setting s, bool on);

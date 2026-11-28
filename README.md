@@ -20,6 +20,8 @@ namespace configuration file.
 | | Control panel | xprismctl |
 |---|---|---|
 | HDR, EDR and wide gamut per output | Displays | `displays`, `display OUTPUT edr on` |
+| Resolution, refresh rate, position, rotation, primary | Displays (CLI for now) | `modes OUTPUT`, `display DP-1 mode 1920x1080@240`, `display OUTPUT position X Y` |
+| Remember the layout | | `displays save`, `displays restore` |
 | Namespaces: create, delete, permissions | Namespaces | `namespaces`, `namespace create`, `grant`, `revoke` |
 | Connected applications and what they may do | Apps | `apps` |
 | Permission prompts from confined applications | Prompts | `agent` |

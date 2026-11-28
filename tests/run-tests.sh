@@ -66,6 +66,33 @@ check delete            "deleted web"                         "$ctl" namespace d
 fails_with gone 1       "no namespace web"                    "$ctl" grant web clipboard.read
 fails_with no-cmd 2     "no command frob"                     "$ctl" frob
 
+# display layout: Xvfb has one output, "screen"; give it a 120 Hz mode too
+xrandr --newmode 1280x720_120 156.25 1280 1376 1512 1744 720 723 728 748 -hsync +vsync >/dev/null 2>&1
+xrandr --newmode 1280x720_60 74.50 1280 1344 1472 1664 720 723 728 748 -hsync +vsync >/dev/null 2>&1
+xrandr --addmode screen 1280x720_120 && xrandr --addmode screen 1280x720_60
+export XDG_CONFIG_HOME=$tmp/config
+check modes             "1280x720 +119\.7[0-9] Hz"             "$ctl" modes screen
+check modes-order       "^ *1280x800 .*current"               "$ctl" modes screen
+check mode-fastest      "^screen +1280x720 120 Hz"            sh -c '"$0" display screen mode 1280x720 && "$0" displays' "$ctl"
+check mode-60           "^screen +1280x720 60 Hz"             sh -c '"$0" display screen mode 1280x720@60 && "$0" displays' "$ctl"
+check screen-resized    "current 1280 x 720"                  xrandr
+fails_with no-rate 1    "no 1280x720 mode at 75.00 Hz \(closest: 59.8" "$ctl" display screen mode 1280x720@75
+fails_with no-size 1    "has no 1000x1000 mode"               "$ctl" display screen mode 1000x1000
+fails_with no-output 1  "no connected output HDMI-9"          "$ctl" display HDMI-9 mode 1280x720
+fails_with bad-mode 2   "WIDTHxHEIGHT"                         "$ctl" display screen mode big
+fails_with all-off 1    "refusing to turn every display off"  "$ctl" display screen off
+check primary           "primary"                             sh -c '"$0" display screen primary && "$0" displays' "$ctl"
+check position          "\+0\+0 normal primary"               "$ctl" displays
+check save              "saved to $tmp/config/xprism/displays.conf" "$ctl" displays save
+check saved-file        "^screen 1280x720@59\.8[0-9] \+0\+0 rotate 0 primary$" cat "$tmp/config/xprism/displays.conf"
+"$ctl" display screen mode 1280x800 >/dev/null
+check moved-away        "^screen +1280x800"                   "$ctl" displays
+check restore           "restored from"                       "$ctl" displays restore
+check restored          "^screen +1280x720 60 Hz"             "$ctl" displays
+fails_with no-rotate 1  "cannot be rotated 90 degrees"        "$ctl" display screen rotate left
+fails_with sandbox-mode 1 "RandR is not available|not allowed"                     env XAUTHORITY="$tmp/box" "$ctl" display screen mode 1280x800
+check sandbox-unchanged "^screen +1280x720 60 Hz"             "$ctl" displays
+
 # an app in the sandbox
 coproc OWNER { XAUTHORITY=$tmp/box exec "$xwin"; }
 pids+=($OWNER_PID)

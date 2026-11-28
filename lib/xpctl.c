@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 
 #include <xcb/randr.h>
@@ -797,4 +798,677 @@ xpctl_agent_answer(xpctl *x, uint32_t id, enum xpctl_answer a)
     if (xerr)
         return fail(x, "cannot answer: %s", x_error_text(xerr));
     return 0;
+}
+
+/* ---- display layout ------------------------------------------------ */
+
+static double
+mode_refresh(const xcb_randr_mode_info_t *m)
+{
+    if (!m->htotal || !m->vtotal)
+        return 0;
+    double v = m->vtotal;
+    if (m->mode_flags & XCB_RANDR_MODE_FLAG_DOUBLE_SCAN)
+        v *= 2;
+    if (m->mode_flags & XCB_RANDR_MODE_FLAG_INTERLACE)
+        v /= 2;
+    return (double) m->dot_clock / ((double) m->htotal * v);
+}
+
+static uint16_t
+rotation_bits(int degrees)
+{
+    switch (degrees) {
+    case 90: return XCB_RANDR_ROTATION_ROTATE_90;
+    case 180: return XCB_RANDR_ROTATION_ROTATE_180;
+    case 270: return XCB_RANDR_ROTATION_ROTATE_270;
+    default: return XCB_RANDR_ROTATION_ROTATE_0;
+    }
+}
+
+static int
+rotation_degrees(uint16_t bits)
+{
+    if (bits & XCB_RANDR_ROTATION_ROTATE_90)
+        return 90;
+    if (bits & XCB_RANDR_ROTATION_ROTATE_180)
+        return 180;
+    if (bits & XCB_RANDR_ROTATION_ROTATE_270)
+        return 270;
+    return 0;
+}
+
+static double
+absd(double v)
+{
+    return v < 0 ? -v : v;
+}
+
+typedef struct {
+    xcb_randr_get_screen_resources_current_reply_t *res;
+    xcb_randr_mode_info_t *modes;
+    int nmodes;
+    xcb_randr_output_t *outputs;
+    int noutputs;
+} resources;
+
+static int
+resources_get(xpctl *x, resources *r)
+{
+    memset(r, 0, sizeof(*r));
+    if (!xpctl_connection(x))
+        return fail(x, "not connected");
+    r->res = xcb_randr_get_screen_resources_current_reply(x->c,
+        xcb_randr_get_screen_resources_current(x->c, x->root), NULL);
+    if (!r->res)
+        return fail(x, "RandR is not available");
+    r->modes = xcb_randr_get_screen_resources_current_modes(r->res);
+    r->nmodes = xcb_randr_get_screen_resources_current_modes_length(r->res);
+    r->outputs = xcb_randr_get_screen_resources_current_outputs(r->res);
+    r->noutputs = xcb_randr_get_screen_resources_current_outputs_length(r->res);
+    return 0;
+}
+
+static const xcb_randr_mode_info_t *
+resources_mode(const resources *r, xcb_randr_mode_t id)
+{
+    for (int i = 0; i < r->nmodes; i++)
+        if (r->modes[i].id == id)
+            return &r->modes[i];
+    return NULL;
+}
+
+static xcb_randr_get_output_info_reply_t *
+output_info(xpctl *x, const resources *r, xcb_randr_output_t id)
+{
+    return xcb_randr_get_output_info_reply(x->c,
+        xcb_randr_get_output_info(x->c, id, r->res->config_timestamp), NULL);
+}
+
+static void
+info_name(xcb_randr_get_output_info_reply_t *info, char *out, size_t size)
+{
+    int len = xcb_randr_get_output_info_name_length(info);
+    if (len >= (int) size)
+        len = size - 1;
+    memcpy(out, xcb_randr_get_output_info_name(info), len);
+    out[len] = 0;
+}
+
+/* the output called name: its id and info (free it) */
+static xcb_randr_get_output_info_reply_t *
+find_output(xpctl *x, const resources *r, const char *name, xcb_randr_output_t *id)
+{
+    for (int i = 0; i < r->noutputs; i++) {
+        xcb_randr_get_output_info_reply_t *info = output_info(x, r, r->outputs[i]);
+        if (!info)
+            continue;
+        char n[32];
+        info_name(info, n, sizeof(n));
+        if (!strcmp(n, name)) {
+            *id = r->outputs[i];
+            return info;
+        }
+        free(info);
+    }
+    return NULL;
+}
+
+static int
+mode_cmp(const void *a, const void *b)
+{
+    const xpctl_mode *m = a, *o = b;
+    long am = (long) m->width * m->height, ao = (long) o->width * o->height;
+    if (am != ao)
+        return am > ao ? -1 : 1;
+    if (m->width != o->width)
+        return m->width > o->width ? -1 : 1;
+    if (m->refresh != o->refresh)
+        return m->refresh > o->refresh ? -1 : 1;
+    return 0;
+}
+
+int
+xpctl_output_modes(xpctl *x, const char *name, xpctl_mode **modes, int *n)
+{
+    *modes = NULL;
+    *n = 0;
+    resources r;
+    if (resources_get(x, &r) < 0)
+        return -1;
+    xcb_randr_output_t id;
+    xcb_randr_get_output_info_reply_t *info = find_output(x, &r, name, &id);
+    if (!info) {
+        free(r.res);
+        return fail(x, "no output %s", name);
+    }
+    xcb_randr_mode_t current = 0;
+    if (info->crtc) {
+        xcb_randr_get_crtc_info_reply_t *c = xcb_randr_get_crtc_info_reply(x->c,
+            xcb_randr_get_crtc_info(x->c, info->crtc, r.res->config_timestamp), NULL);
+        if (c)
+            current = c->mode;
+        free(c);
+    }
+    int count = xcb_randr_get_output_info_modes_length(info);
+    xcb_randr_mode_t *ids = xcb_randr_get_output_info_modes(info);
+    xpctl_mode *list = calloc(count ? count : 1, sizeof(*list));
+    if (!list) {
+        free(info);
+        free(r.res);
+        return fail(x, "out of memory");
+    }
+    int k = 0;
+    for (int i = 0; i < count; i++) {
+        const xcb_randr_mode_info_t *m = resources_mode(&r, ids[i]);
+        if (!m)
+            continue;
+        xpctl_mode mode = {
+            .width = m->width, .height = m->height, .refresh = mode_refresh(m),
+            .preferred = i < info->num_preferred, .current = ids[i] == current,
+        };
+        /* the same size and rate twice (other timings): keep one */
+        int dup = -1;
+        for (int j = 0; j < k; j++)
+            if (list[j].width == mode.width && list[j].height == mode.height &&
+                absd(list[j].refresh - mode.refresh) < 0.01)
+                dup = j;
+        if (dup >= 0) {
+            list[dup].preferred |= mode.preferred;
+            list[dup].current |= mode.current;
+            continue;
+        }
+        list[k++] = mode;
+    }
+    qsort(list, k, sizeof(*list), mode_cmp);
+    free(info);
+    free(r.res);
+    *modes = list;
+    *n = k;
+    return 0;
+}
+
+int
+xpctl_layout_get(xpctl *x, xpctl_layout **out, int *n)
+{
+    *out = NULL;
+    *n = 0;
+    resources r;
+    if (resources_get(x, &r) < 0)
+        return -1;
+    xcb_randr_get_output_primary_reply_t *pr = xcb_randr_get_output_primary_reply(x->c,
+        xcb_randr_get_output_primary(x->c, x->root), NULL);
+    xcb_randr_output_t primary = pr ? pr->output : 0;
+    free(pr);
+    xpctl_layout *list = calloc(r.noutputs ? r.noutputs : 1, sizeof(*list));
+    if (!list) {
+        free(r.res);
+        return fail(x, "out of memory");
+    }
+    int k = 0;
+    for (int i = 0; i < r.noutputs; i++) {
+        xcb_randr_get_output_info_reply_t *info = output_info(x, &r, r.outputs[i]);
+        if (!info)
+            continue;
+        if (info->connection != XCB_RANDR_CONNECTION_CONNECTED) {
+            free(info);
+            continue;
+        }
+        xpctl_layout *l = &list[k++];
+        info_name(info, l->name, sizeof(l->name));
+        l->primary = r.outputs[i] == primary;
+        if (info->crtc) {
+            xcb_randr_get_crtc_info_reply_t *c = xcb_randr_get_crtc_info_reply(x->c,
+                xcb_randr_get_crtc_info(x->c, info->crtc, r.res->config_timestamp), NULL);
+            const xcb_randr_mode_info_t *m = c ? resources_mode(&r, c->mode) : NULL;
+            if (c && m) {
+                l->enabled = true;
+                l->width = m->width;
+                l->height = m->height;
+                l->refresh = mode_refresh(m);
+                l->x = c->x;
+                l->y = c->y;
+                l->rotation = rotation_degrees(c->rotation);
+            }
+            free(c);
+        }
+        free(info);
+    }
+    free(r.res);
+    *out = list;
+    *n = k;
+    return 0;
+}
+
+#define MAX_CRTC_OUTPUTS 8
+
+typedef struct {
+    xcb_randr_crtc_t id;
+    uint16_t rotations;         /* what it can do */
+    /* now */
+    xcb_randr_mode_t mode;
+    int16_t x, y;
+    uint16_t rotation;
+    int w, h;                   /* on the screen (rotated) */
+    xcb_randr_output_t out[MAX_CRTC_OUTPUTS];
+    int nout;
+    /* planned */
+    bool changed;
+    xcb_randr_mode_t nmode;
+    int16_t nx, ny;
+    uint16_t nrot;
+    int nw, nh;
+    xcb_randr_output_t nout_ids[MAX_CRTC_OUTPUTS];
+    int nnout;
+} crtc_plan;
+
+static void
+rotated_size(const xcb_randr_mode_info_t *m, uint16_t rot, int *w, int *h)
+{
+    bool swap = rot & (XCB_RANDR_ROTATION_ROTATE_90 | XCB_RANDR_ROTATION_ROTATE_270);
+    *w = m ? (swap ? m->height : m->width) : 0;
+    *h = m ? (swap ? m->width : m->height) : 0;
+}
+
+static bool
+set_crtc(xpctl *x, const resources *r, xcb_randr_crtc_t id, xcb_randr_mode_t mode,
+         int16_t cx, int16_t cy, uint16_t rot, int nout, const xcb_randr_output_t *outs)
+{
+    xcb_randr_set_crtc_config_reply_t *rep = xcb_randr_set_crtc_config_reply(x->c,
+        xcb_randr_set_crtc_config(x->c, id, XCB_CURRENT_TIME, r->res->config_timestamp,
+                                  cx, cy, mode, mode ? rot : XCB_RANDR_ROTATION_ROTATE_0,
+                                  mode ? nout : 0, outs), NULL);
+    bool ok = rep && rep->status == XCB_RANDR_SET_CONFIG_SUCCESS;
+    free(rep);
+    return ok;
+}
+
+static bool
+set_screen_size(xpctl *x, int w, int h)
+{
+    const xcb_setup_t *setup = xcb_get_setup(x->c);
+    xcb_screen_t *s = xcb_setup_roots_iterator(setup).data;
+    for (xcb_screen_iterator_t it = xcb_setup_roots_iterator(setup); it.rem;
+         xcb_screen_next(&it))
+        if (it.data->root == x->root)
+            s = it.data;
+    /* keep the DPI the screen has */
+    uint32_t mmw = s->width_in_pixels ? (uint32_t) w * s->width_in_millimeters / s->width_in_pixels
+                                      : (uint32_t) w * 254 / 960;
+    uint32_t mmh = s->height_in_pixels ? (uint32_t) h * s->height_in_millimeters / s->height_in_pixels
+                                       : (uint32_t) h * 254 / 960;
+    xcb_generic_error_t *err = xcb_request_check(x->c,
+        xcb_randr_set_screen_size_checked(x->c, x->root, w, h, mmw ? mmw : 1, mmh ? mmh : 1));
+    free(err);
+    return !err;
+}
+
+int
+xpctl_layout_apply(xpctl *x, const xpctl_layout *list, int n)
+{
+    resources r;
+    if (resources_get(x, &r) < 0)
+        return -1;
+    int ncrtc = xcb_randr_get_screen_resources_current_crtcs_length(r.res);
+    xcb_randr_crtc_t *crtc_ids = xcb_randr_get_screen_resources_current_crtcs(r.res);
+    crtc_plan *p = calloc(ncrtc ? ncrtc : 1, sizeof(*p));
+    if (!p) {
+        free(r.res);
+        return fail(x, "out of memory");
+    }
+    int ret = -1;
+    int old_w = 0, old_h = 0;
+    for (int i = 0; i < ncrtc; i++) {
+        p[i].id = crtc_ids[i];
+        xcb_randr_get_crtc_info_reply_t *c = xcb_randr_get_crtc_info_reply(x->c,
+            xcb_randr_get_crtc_info(x->c, crtc_ids[i], r.res->config_timestamp), NULL);
+        if (!c)
+            continue;
+        p[i].rotations = c->rotations;
+        p[i].mode = c->mode;
+        p[i].x = c->x;
+        p[i].y = c->y;
+        p[i].rotation = c->rotation;
+        p[i].w = c->width;
+        p[i].h = c->height;
+        int no = xcb_randr_get_crtc_info_outputs_length(c);
+        if (no > MAX_CRTC_OUTPUTS)
+            no = MAX_CRTC_OUTPUTS;
+        memcpy(p[i].out, xcb_randr_get_crtc_info_outputs(c), no * sizeof(*p[i].out));
+        p[i].nout = no;
+        free(c);
+        /* the plan starts as what is there */
+        p[i].nmode = p[i].mode;
+        p[i].nx = p[i].x;
+        p[i].ny = p[i].y;
+        p[i].nrot = p[i].rotation;
+        p[i].nw = p[i].w;
+        p[i].nh = p[i].h;
+        memcpy(p[i].nout_ids, p[i].out, sizeof(p[i].out));
+        p[i].nnout = p[i].nout;
+        if (p[i].mode) {
+            if (p[i].x + p[i].w > old_w)
+                old_w = p[i].x + p[i].w;
+            if (p[i].y + p[i].h > old_h)
+                old_h = p[i].y + p[i].h;
+        }
+    }
+
+    xcb_randr_output_t primary = 0;
+    for (int li = 0; li < n; li++) {
+        const xpctl_layout *L = &list[li];
+        xcb_randr_output_t oid;
+        xcb_randr_get_output_info_reply_t *info = find_output(x, &r, L->name, &oid);
+        if (!info) {
+            fail(x, "no output %s", L->name);
+            goto out;
+        }
+        crtc_plan *cur = NULL;
+        for (int i = 0; i < ncrtc; i++)
+            for (int k = 0; k < p[i].nnout; k++)
+                if (p[i].nout_ids[k] == oid)
+                    cur = &p[i];
+        if (!L->enabled) {
+            if (cur) {
+                int k = 0;
+                for (int j = 0; j < cur->nnout; j++)
+                    if (cur->nout_ids[j] != oid)
+                        cur->nout_ids[k++] = cur->nout_ids[j];
+                cur->nnout = k;
+                if (!k)
+                    cur->nmode = 0;
+                cur->changed = true;
+            }
+            free(info);
+            continue;
+        }
+        if (info->connection != XCB_RANDR_CONNECTION_CONNECTED) {
+            free(info);
+            fail(x, "%s is not connected", L->name);
+            goto out;
+        }
+        /* the mode: that size, at the rate asked for or the fastest */
+        int count = xcb_randr_get_output_info_modes_length(info);
+        xcb_randr_mode_t *ids = xcb_randr_get_output_info_modes(info);
+        const xcb_randr_mode_info_t *best = NULL;
+        for (int i = 0; i < count; i++) {
+            const xcb_randr_mode_info_t *m = resources_mode(&r, ids[i]);
+            if (!m || m->width != L->width || m->height != L->height)
+                continue;
+            if (!best)
+                best = m;
+            else if (L->refresh > 0 ? absd(mode_refresh(m) - L->refresh) <
+                                          absd(mode_refresh(best) - L->refresh)
+                                    : mode_refresh(m) > mode_refresh(best))
+                best = m;
+        }
+        if (!best) {
+            free(info);
+            fail(x, "%s has no %dx%d mode", L->name, L->width, L->height);
+            goto out;
+        }
+        if (L->refresh > 0 && absd(mode_refresh(best) - L->refresh) > 0.6) {
+            free(info);
+            fail(x, "%s has no %dx%d mode at %.2f Hz (closest: %.2f Hz)", L->name,
+                 L->width, L->height, L->refresh, mode_refresh(best));
+            goto out;
+        }
+        /* the CRTC: the one it is on, or a free one it can use */
+        crtc_plan *use = cur;
+        if (!use) {
+            int nposs = xcb_randr_get_output_info_crtcs_length(info);
+            xcb_randr_crtc_t *poss = xcb_randr_get_output_info_crtcs(info);
+            for (int j = 0; j < nposs && !use; j++)
+                for (int i = 0; i < ncrtc; i++)
+                    if (p[i].id == poss[j] && !p[i].nmode && !p[i].nnout)
+                        use = &p[i];
+        }
+        free(info);
+        if (!use) {
+            fail(x, "no display controller is free for %s", L->name);
+            goto out;
+        }
+        uint16_t rot = rotation_bits(L->rotation);
+        if (use->rotations && !(use->rotations & rot)) {
+            fail(x, "%s cannot be rotated %d degrees", L->name, L->rotation);
+            goto out;
+        }
+        if (L->x < 0 || L->y < 0 || L->x > 32767 || L->y > 32767) {
+            fail(x, "position %d,%d is outside the screen", L->x, L->y);
+            goto out;
+        }
+        use->nmode = best->id;
+        use->nx = L->x;
+        use->ny = L->y;
+        use->nrot = rot;
+        rotated_size(best, rot, &use->nw, &use->nh);
+        use->nout_ids[0] = oid;
+        use->nnout = 1;
+        use->changed = true;
+        if (L->primary)
+            primary = oid;
+    }
+
+    /* the new screen: big enough for every CRTC */
+    int W = 0, H = 0;
+    for (int i = 0; i < ncrtc; i++) {
+        if (!p[i].nmode)
+            continue;
+        if (p[i].nx + p[i].nw > W)
+            W = p[i].nx + p[i].nw;
+        if (p[i].ny + p[i].nh > H)
+            H = p[i].ny + p[i].nh;
+    }
+    if (!W || !H) {
+        fail(x, "refusing to turn every display off");
+        goto out;
+    }
+    xcb_randr_get_screen_size_range_reply_t *range = xcb_randr_get_screen_size_range_reply(x->c,
+        xcb_randr_get_screen_size_range(x->c, x->root), NULL);
+    if (range) {
+        bool too_big = W > range->max_width || H > range->max_height;
+        int mw = range->max_width, mh = range->max_height;
+        if (W < range->min_width)
+            W = range->min_width;
+        if (H < range->min_height)
+            H = range->min_height;
+        free(range);
+        if (too_big) {
+            fail(x, "the screen would be %dx%d; this GPU shows at most %dx%d", W, H, mw, mh);
+            goto out;
+        }
+    }
+
+    /* xrandr's order: off what will not fit, resize, then set */
+    xcb_grab_server(x->c);
+    bool ok = true, resized = false;
+    for (int i = 0; i < ncrtc && ok; i++)
+        if (p[i].mode && (p[i].x + p[i].w > W || p[i].y + p[i].h > H)) {
+            ok = set_crtc(x, &r, p[i].id, 0, 0, 0, 0, 0, NULL);
+            p[i].changed = true;
+        }
+    if (ok && (W != old_w || H != old_h)) {
+        ok = set_screen_size(x, W, H);
+        resized = ok;
+    }
+    for (int i = 0; i < ncrtc && ok; i++)
+        if (p[i].changed)
+            ok = set_crtc(x, &r, p[i].id, p[i].nmode, p[i].nx, p[i].ny, p[i].nrot,
+                          p[i].nnout, p[i].nout_ids);
+    if (ok && primary) {
+        xcb_generic_error_t *err = xcb_request_check(x->c,
+            xcb_randr_set_output_primary_checked(x->c, x->root, primary));
+        ok = !err;
+        free(err);
+    }
+    if (!ok) {
+        /* put back what was there: the changed CRTCs off, the old size,
+           then the old CRTCs */
+        resources now;
+        if (resources_get(x, &now) == 0) {
+            for (int i = 0; i < ncrtc; i++)
+                if (p[i].changed)
+                    set_crtc(x, &now, p[i].id, 0, 0, 0, 0, 0, NULL);
+            if (resized)
+                set_screen_size(x, old_w, old_h);
+            free(now.res);
+        }
+        if (resources_get(x, &now) == 0) {
+            for (int i = 0; i < ncrtc; i++)
+                if (p[i].changed && p[i].mode)
+                    set_crtc(x, &now, p[i].id, p[i].mode, p[i].x, p[i].y, p[i].rotation,
+                             p[i].nout, p[i].out);
+            free(now.res);
+        }
+        fail(x, "the display driver refused this layout; the old one is back");
+    }
+    xcb_ungrab_server(x->c);
+    xcb_flush(x->c);
+    ret = ok ? 0 : -1;
+out:
+    free(p);
+    free(r.res);
+    return ret;
+}
+
+/* ---- the saved layout ---------------------------------------------- */
+
+const char *
+xpctl_layout_path(void)
+{
+    static char path[4096];
+    const char *cfg = getenv("XDG_CONFIG_HOME");
+    if (cfg && *cfg)
+        snprintf(path, sizeof(path), "%s/xprism/displays.conf", cfg);
+    else
+        snprintf(path, sizeof(path), "%s/.config/xprism/displays.conf",
+                 getenv("HOME") ? getenv("HOME") : ".");
+    return path;
+}
+
+int
+xpctl_layout_save(xpctl *x, const char *path, const xpctl_layout *list, int n)
+{
+    if (!path)
+        path = xpctl_layout_path();
+    char dir[4096];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = 0;
+        for (char *q = dir + 1; *q; q++)    /* mkdir -p */
+            if (*q == '/') {
+                *q = 0;
+                mkdir(dir, 0755);
+                *q = '/';
+            }
+        mkdir(dir, 0755);
+    }
+    char tmp[4200];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return fail(x, "cannot write %s: %s", tmp, strerror(errno));
+    fprintf(f, "# XPrism display layout: xprismctl displays save / restore\n"
+               "# OUTPUT WIDTHxHEIGHT@HZ +X+Y rotate DEGREES [primary]   or   OUTPUT off\n");
+    for (int i = 0; i < n; i++) {
+        if (!list[i].enabled)
+            fprintf(f, "%s off\n", list[i].name);
+        else
+            fprintf(f, "%s %dx%d@%.2f +%d+%d rotate %d%s\n", list[i].name, list[i].width,
+                    list[i].height, list[i].refresh, list[i].x, list[i].y, list[i].rotation,
+                    list[i].primary ? " primary" : "");
+    }
+    if (fclose(f) != 0 || rename(tmp, path) != 0) {
+        remove(tmp);
+        return fail(x, "cannot write %s: %s", path, strerror(errno));
+    }
+    return 0;
+}
+
+static bool
+parse_layout_line(char *line, xpctl_layout *l)
+{
+    memset(l, 0, sizeof(*l));
+    char *save = NULL;
+    char *name = strtok_r(line, " \t\r\n", &save);
+    if (!name || name[0] == '#')
+        return false;
+    snprintf(l->name, sizeof(l->name), "%s", name);
+    char *mode = strtok_r(NULL, " \t\r\n", &save);
+    if (!mode)
+        return false;
+    if (!strcmp(mode, "off"))
+        return true;
+    if (sscanf(mode, "%dx%d@%lf", &l->width, &l->height, &l->refresh) < 2)
+        return false;
+    l->enabled = true;
+    for (char *t; (t = strtok_r(NULL, " \t\r\n", &save));) {
+        if (t[0] == '+')
+            sscanf(t, "+%d+%d", &l->x, &l->y);
+        else if (!strcmp(t, "rotate")) {
+            char *d = strtok_r(NULL, " \t\r\n", &save);
+            l->rotation = d ? atoi(d) : 0;
+        } else if (!strcmp(t, "primary"))
+            l->primary = true;
+    }
+    return l->width > 0 && l->height > 0;
+}
+
+int
+xpctl_layout_load(const char *path, xpctl_layout **out, int *n)
+{
+    *out = NULL;
+    *n = 0;
+    if (!path)
+        path = xpctl_layout_path();
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;           /* nothing saved */
+    int cap = 8, k = 0;
+    xpctl_layout *list = malloc(cap * sizeof(*list));
+    char line[512];
+    while (list && fgets(line, sizeof(line), f)) {
+        if (k == cap) {
+            xpctl_layout *bigger = realloc(list, 2 * cap * sizeof(*list));
+            if (!bigger)
+                break;
+            list = bigger;
+            cap *= 2;
+        }
+        if (parse_layout_line(line, &list[k]))
+            k++;
+    }
+    fclose(f);
+    *out = list;
+    *n = list ? k : 0;
+    return 0;
+}
+
+int
+xpctl_layout_restore(xpctl *x, const char *path)
+{
+    xpctl_layout *saved, *now;
+    int ns, nn;
+    if (xpctl_layout_load(path, &saved, &ns) < 0)
+        return -1;
+    if (xpctl_layout_get(x, &now, &nn) < 0) {
+        free(saved);
+        return -1;
+    }
+    /* only the outputs connected now: a monitor that is not plugged in
+       keeps its line for next time */
+    int k = 0;
+    for (int i = 0; i < ns; i++) {
+        bool connected = false;
+        for (int j = 0; j < nn; j++)
+            if (!strcmp(saved[i].name, now[j].name))
+                connected = true;
+        if (connected)
+            saved[k++] = saved[i];
+    }
+    free(now);
+    int ret = k ? xpctl_layout_apply(x, saved, k) : 0;
+    free(saved);
+    return ret;
 }
